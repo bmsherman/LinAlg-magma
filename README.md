@@ -1,18 +1,15 @@
 LinAlg-magma
 ============
 
-LinAlg-hmatrix provides a GPU-powered backend for the Haskell library
-[LinAlg](https://github.com/bmsherman/LinAlg/). The backend has the
-following dependencies:
+LinAlg-magma provides a GPU-powered backend for the Haskell library
+[LinAlg](https://github.com/bmsherman/LinAlg/). Therefore, it allows
+execution of purely functional numerical linear algebra operations
+on the GPU.
 
-1. [cublas](https://github.com/bmsherman/cublas), which provides FFI
-bindings for the CUBLAS library.
-
-2. [magma-gpu](https://github.com/bmsherman/magma-gpu), which provides FFI
-bindings for the MAGMA GPU library.
-
-3. [LinAlg](https://github.com/bmsherman/LinAlg/), which provides the
-purely functional interface for computations.
+Additionally, a mutable interface is provided (at a higher level of 
+abstraction than the FFI bindings) which can be used in conjunction with
+the immutable one in order to achieve better performance (in particular,
+to avoid unnecessary copying).
 
 Usage
 -----
@@ -28,5 +25,22 @@ monadic interface. The type system allows for mutable operations to read
 from either immutable or mutable datatypes, so you can easily mix the two
 and get the best of both worlds.
 
-I will hopefully describe and document this system in more detail in the
-future!
+### Documentation
+
+[The haddock documentation](http://bmsherman.github.io/haddock/LinAlg-magma/)
+is relatively complete. In particular, there is a [semi-thorough
+explanation of of the mutable and immutable interface work together](http://bmsherman.github.io/haddock/LinAlg-magma/Numeric-LinAlg-Magma-Mutable.html#g:1).
+
+### Installation
+
+LinAlg-magma has three dependencies which are not yet available on Hackage.
+Before installing LinAlg-magma, you must install these three packages:
+
+1. [cublas](https://github.com/bmsherman/cublas), which provides FFI
+bindings for the CUBLAS library.
+
+2. [magma-gpu](https://github.com/bmsherman/magma-gpu), which provides FFI
+bindings for the MAGMA GPU library.
+
+3. [LinAlg](https://github.com/bmsherman/LinAlg/), which provides the
+purely functional interface for computations.
