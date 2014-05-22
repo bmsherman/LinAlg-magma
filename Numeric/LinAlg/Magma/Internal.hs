@@ -1,6 +1,39 @@
-{-# LANGUAGE RankNTypes #-}
+{- | This module uses the mutable interface to provide an immutable,
+purely functional interface for matrix computations on the GPU. Because
+most of these functions are part of the LinAlg interface, there are not
+documented here. -}
 
-module Numeric.LinAlg.Magma.Internal where
+module Numeric.LinAlg.Magma.Internal (
+  -- * Data types
+  Matrix (..),
+
+  -- * LinAlg operations
+  -- ** Data transfer
+  fromList, toList, fromLists, toLists,
+  toRows, toColumns, fromRows, fromColumns,
+  asColMat, asColVec,
+  fromDiag, takeDiag',
+  -- ** Addition and scalar multiplication
+  vAddScale,
+  vscal, vplus, vminus,
+  (.*), (.+), (.-),
+  -- ** Multiplication
+  mXv, vXm, mXm,
+  -- ** Core operations
+  mdim, mrows, mcols, len,
+  trans,
+  ident,
+  outer,
+  elementwiseProdV, elementwiseProdM,
+  -- ** Solving linear systems
+  genSolveV, genSolveM,
+  tSolveV, tSolveM,
+  (^\), (.\),
+  chol,
+  -- ** Other functions
+  constant, constantM, trsymprod
+
+) where
 
 import Control.Applicative ((<$>))
 import Control.Monad (forM_)
@@ -20,23 +53,14 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import Numeric.LinAlg.Magma.Mutable hiding (dim, ld)
 
-data Ice
-
-type Mat = MatP Ice
-type Vec = VecP Ice
-
-makeST :: (forall s. ST s (c s e)) -> c Ice e
-makeST (ST x) = unsafePerformIO x
-
-runST :: (forall s. ST s a) -> a
-runST (ST x) = unsafePerformIO x
-
-
+-- | An immutable matrix datatype with a transpose flag, so we can avoid
+-- unnecessary transposition.
 data Matrix a = Matrix {
   payload :: Mat a, 
   trns :: Bool
   }
 
+-- | Matrix transpose.
 trans :: Matrix a -> Matrix a
 trans (Matrix p t) = Matrix p (not t)
 
@@ -47,6 +71,7 @@ transOp :: Bool -> Operation
 transOp True = T
 transOp False = N
 
+-- | Dimension of a matrix (rows, columns).
 mdim :: Matrix a -> (Int, Int)
 mdim (Matrix (MatP _ (m,n) _) t) = if t then (n,m) else (m,n)
 
@@ -54,22 +79,20 @@ mrows, mcols :: Matrix a -> Int
 mrows = fst . mdim
 mcols = snd . mdim
 
-creating :: (forall s. ST s (c s e)) -> (forall s. c s e -> ST s b) 
-         -> c Ice e
-creating creator f = makeST $ do
-  x <- creator
-  f x
-  return x
+fromList :: CNum e => [e] -> Vec e
+fromList xs = makeRW $ fromListP xs
 
-fromList xs = makeST $ fromListP xs
-toList x = runST $ toListP x
+toList :: CNum e => Vec e -> [e]
+toList x = runRW $ toListP x
 
---accepts input in ROW-MAJOR format, for now
+-- | In line with the LinAlg specification, this function accepts
+-- input in /row-major/ format.
 fromLists :: Storable a => [[a]] -> Matrix a
-fromLists xs = Matrix (makeST $ fromListsP (transpose xs)) False
+fromLists xs = Matrix (makeRW $ fromListsP (transpose xs)) False
 
+-- | Converts a matrix to a list of lists in /row-major/ format.
 toLists :: CNum a => Matrix a -> [[a]]
-toLists a@(Matrix pa ta) = if ta then runST $ toListsP pa else toLists (memtrans' a)
+toLists a@(Matrix pa ta) = if ta then runRW $ toListsP pa else toLists (memtrans' a)
 
 mXm :: CNum e => Matrix e -> Matrix e -> Matrix e
 mXm a@(Matrix pa t) b@(Matrix pb t') = dimCheck "mXm" [[k,k']] $ 
@@ -101,14 +124,15 @@ k .* a@(Matrix pa t) = Matrix pb t where
 trsymprod :: CNum e => Matrix e -> Matrix e -> e
 trsymprod a@(Matrix pa ta) b@(Matrix pb tb) =
   if ta==tb 
-    then runST $ dot (asVecP pa) (asVecP pb)
+    then runRW $ dot (asVecP pa) (asVecP pb)
     else trsymprod a (memtrans' b)
 
 
---Switch between row-major and column-major storage
+-- | Switch between row-major and column-major storage. That is, the matrix
+-- is transposed in memory, but /not/ logically.
 memtrans' :: CNum e => Matrix e -> Matrix e
 memtrans' a@(Matrix pa ta) = Matrix pa' (not ta) where
-  pa' = makeST $ memtrans pa 
+  pa' = makeRW $ memtrans pa 
 
 
 -- | addScale beta a b = a + beta*b
@@ -117,6 +141,7 @@ addScale beta a@(Matrix pa ta) b@(Matrix pb tb) = Matrix pc False where
   pc = creating (makeMatP (mdim a)) $ \p ->
     geam 1 (pa, transOp ta) beta (pb, transOp tb) p
 
+-- | General linear solver
 genSolveV :: CNum e => Matrix e -> Vec e -> Vec e
 genSolveV a@(Matrix pa tra) b = 
   creating (makeCopyVecP b) $ \(VecP px n 1) -> do
@@ -125,6 +150,7 @@ genSolveV a@(Matrix pa tra) b =
   where
   makeCopy trbool = if trbool then memtrans else makeCopyMatP
 
+-- | General linear solver
 genSolveM :: CNum e => Matrix e -> Matrix e -> Matrix e
 genSolveM a@(Matrix pa tra) b@(Matrix pb trb) = Matrix px False
   where
@@ -133,6 +159,7 @@ genSolveM a@(Matrix pa tra) b@(Matrix pb trb) = Matrix px False
     pa' <- makeCopy tra pa
     gesv pa' pb
   
+-- | Solution of a triangular system.
 tSolveM :: CNum e => FillMode -> SideMode -> Matrix e -> Matrix e -> Matrix e
 tSolveM fill side u b@(Matrix _ True) = 
   trans $ tSolveM (flip fill) (swap side) (trans u) (trans b) where
@@ -147,6 +174,7 @@ tSolveM fill side a@(Matrix pa ta) b@(Matrix pb False) = Matrix px False where
   flip Lower = Upper
   actfill = if ta then flip else id
 
+-- | Solution of a triangular system.
 tSolveV :: CNum e => FillMode -> Matrix e -> Vec e -> Vec e
 tSolveV fill a@(Matrix pa ta) b = creating (makeCopyVecP b) $ \x ->
   trsv (pa, actfill fill, transOp ta, NonUnit) x
@@ -155,8 +183,9 @@ tSolveV fill a@(Matrix pa ta) b = creating (makeCopyVecP b) $ \x ->
   flip Lower = Upper
   actfill = if ta then flip else id
 
---IMPORTANT NOTE: THE RETURNED MATRIX IS CORRECT ON THE LOWER TRIANGLE,
---BUT THE OTHER ENTRIES ARE NOT ZEROED OUT! SO BE VERY, VERY CAREFUL!
+-- | Cholesky decomposition.
+-- __Important Note__: The entries above the diagonal are *not* zeroed
+-- out, so be careful!
 chol :: CNum e => Matrix e -> Matrix e
 chol a@(Matrix pa ta) = magmaHandle `seq` Matrix pl ta where
   pl = creating (makeCopyMatP pa) $ \p -> 
@@ -181,12 +210,12 @@ asColVec a@(Matrix pa ta) = if ta
 
 asColMatP :: CNum e => Vec e -> Mat e
 asColMatP (VecP px n 1) = MatP px (n,1) n
-asColMatP v = asColMatP $ makeST (makeCopyVecP v)
+asColMatP v = asColMatP $ makeRW (makeCopyVecP v)
 
 asColVecP :: CNum e => Mat e -> Vec e
 asColVecP a@(MatP px (m,n) lda) = if m == lda
   then VecP px (m*n) 1
-  else asColVecP $ makeST (makeCopyMatP a)
+  else asColVecP $ makeRW (makeCopyMatP a)
 
 outer :: CNum e => Vec e -> Vec e -> Matrix e
 outer u v = Matrix pa False where
@@ -250,10 +279,10 @@ fromRows :: CNum e => [Vec e] -> Matrix e
 fromRows = trans . fromColumns
 
 constant :: CNum a => a -> Int -> Vec a
-constant alpha n = makeST $ do
+constant alpha n = makeRW $ do
   (VecP px _ _) <- fromListP [alpha]
   return (VecP px n 0)
 
 constantM :: CNum a => a -> (Int, Int) -> Matrix a
 constantM alpha (m,n) = Matrix (MatP pa (m,n) 0) False where
-  (VecP pa _ 1) = makeST $ makeCopyVecP (constant alpha m)
+  (VecP pa _ 1) = makeRW $ makeCopyVecP (constant alpha m)

@@ -81,7 +81,7 @@ instance C.CNum e => Matr e C.Vec C.Matrix where
   fromDiag = C.fromDiag
   takeDiag = C.takeDiag'
 
-  x >.< y = C.runST $ C.dot x y
+  x >.< y = C.runRW $ C.dot x y
   len (C.VecP _ size _) = size
 
   outer = C.outer
