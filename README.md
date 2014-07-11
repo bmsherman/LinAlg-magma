@@ -37,10 +37,13 @@ LinAlg-magma has three dependencies which are not yet available on Hackage.
 Before installing LinAlg-magma, you must install these three packages:
 
 1. [cublas](https://github.com/bmsherman/cublas), which provides FFI
-bindings for the CUBLAS library.
+bindings for the CUBLAS library. This package is now available on
+Hackage, and should be automatically installed.
 
 2. [magma-gpu](https://github.com/bmsherman/magma-gpu), which provides FFI
-bindings for the MAGMA GPU library.
+bindings for the MAGMA GPU library. This package is not on Hackage, and
+must be manually installed.
 
 3. [LinAlg](https://github.com/bmsherman/LinAlg/), which provides the
-purely functional interface for computations.
+purely functional interface for computations. This package is not on 
+Hackage, and must be manually installed.
