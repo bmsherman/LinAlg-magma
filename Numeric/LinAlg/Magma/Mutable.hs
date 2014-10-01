@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleInstances, RankNTypes, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DataKinds, KindSignatures, TypeOperators #-}
 
 {- | This module provides a mutable interface for performing GPU
 computations using the CUBLAS and MAGMA libraries. It provides a higher
@@ -9,7 +10,7 @@ module Numeric.LinAlg.Magma.Mutable (
 
   -- * The read-write monad
   RW,
-  makeRW, runRW, creating,
+  makeRWV, makeRWM, runRW, creatingV, creatingM,
   -- * Data types
   CNum (..),
   -- ** Mutable
@@ -62,6 +63,9 @@ import Foreign.CUDA.Cublas.Types
 import qualified Foreign.CUDA.Cublas.FFI as C
 import qualified Foreign.CUDA.Cublas as C
 import qualified Foreign.CUDA.Magma as Magma
+import qualified Foreign.CUDA.Magma.Types as Magma
+
+import GHC.TypeLits -- (Nat, (*))
 
 import System.Mem.Weak (addFinalizer)
 import System.IO.Unsafe (unsafePerformIO)
@@ -110,7 +114,7 @@ newtype RW s a = RW { unRW :: IO a } deriving (Functor, Applicative, Monad)
 -- | A type for vectors which reside on the GPU.
 -- The first type argument is a phantom type that is used similarly to the
 -- state type in the 'ST' monad.
-data VecP s a = VecP
+data VecP s (n :: Nat) a = VecP
   { ptrV   :: DevicePtr a -- ^ a pointer to the payload on the GPU
   , len    :: Int -- ^ the number of elements in the vector
   , stride :: Int -- ^ the offset in the payload from one element of the 
@@ -121,7 +125,7 @@ data VecP s a = VecP
 -- in column-major format, which is the format preferred by CUBLAS.
 -- The first type argument is a phantom type that is used similarly to the
 -- state type in the 'ST' monad.
-data MatP s a = MatP
+data MatP s (m :: Nat) (n :: Nat) a = MatP
   { ptrM :: DevicePtr a -- ^ a pointer to the payload on the GPU
   , dim  :: (Int, Int) -- ^ the dimensions of the matrix (rows, columns)
   , ld   :: Int -- ^ the leading dimension of the matrix
@@ -148,8 +152,11 @@ type Vec = VecP Ice
 -- type variable to 'Ice', indicating that the value is now immutable.
 -- We do /not/ need to make a copy of the mutable value; rather, it
 -- may no longer be mutated.
-makeRW :: (forall s. RW s (c s e)) -> c Ice e
-makeRW (RW x) = unsafePerformIO x
+makeRWV :: (forall s. RW s (VecP s n e)) -> Vec n e
+makeRWV (RW x) = unsafePerformIO x
+
+makeRWM :: (forall s. RW s (MatP s n m e)) -> Mat n m e
+makeRWM (RW x) = unsafePerformIO x
 
 -- | If a computation in the 'RW' monad is valid for /all/ state threads,
 -- and produces a type which is independent of the state thread, then we
@@ -162,13 +169,19 @@ runRW (RW x) = unsafePerformIO x
 -- structure, the second argument operates on the first once
 -- it has been constructed, and the resulting data structure is returned
 -- as an immutable result.
-creating :: (forall s. RW s (c s e)) -> (forall s. c s e -> RW s b) 
-         -> c Ice e
-creating creator f = makeRW $ do
+creatingV :: (forall s. RW s (VecP s n e)) -> (forall s. VecP s n e -> RW s b) 
+         -> Vec n e
+creatingV creator f = makeRWV $ do
   x <- creator
   f x
   return x
 
+creatingM :: (forall s. RW s (MatP s n m e)) -> (forall s. MatP s n m e -> RW s b) 
+         -> Mat n m e
+creatingM creator f = makeRWM $ do
+  x <- creator
+  f x
+  return x
 
 -- | A global handle created when CUBLAS initializes that is passed
 -- to all CUBLAS calls.
@@ -209,13 +222,13 @@ makeCopyArray n pa = do
 
 -- | Make a new matrix on the GPU with given dimensions. Elements are
 -- uninitialized.
-makeMatP :: Storable a => (Int, Int) -> RW s (MatP s a)
+makeMatP :: Storable a => (Int, Int) -> RW s (MatP s m n a)
 makeMatP dim@(m,n) = do
   p <- RW $ makeArray (m*n)
   return $ MatP p dim m
 
 -- | Make a copy of a matrix.
-makeCopyMatP :: Storable a => MatP t a -> RW s (MatP s a)
+makeCopyMatP :: Storable a => MatP t m n a -> RW s (MatP s m n a)
 makeCopyMatP (MatP pa dim@(m,n) lda) = 
   if m == lda 
     then do
@@ -225,12 +238,12 @@ makeCopyMatP (MatP pa dim@(m,n) lda) =
     else error "makeCopyMatP: Not yet implemented"
 
 -- | Make a copy of a vector.
-copy :: C.Cublas a => VecP t a -> VecP s a -> RW s ()
+copy :: C.Cublas a => VecP t n a -> VecP s n a -> RW s ()
 copy (VecP px nx incx) (VecP py ny incy) = dimCheck "copy" [[nx,ny]] $
   RW $ C.copy handle nx px incx py incy
 
 -- | Create a new vector from a list.
-fromListP :: Storable a => [a] -> RW s (VecP s a)
+fromListP :: Storable a => [a] -> RW s (VecP s n a)
 fromListP xs = do
   px <- RW $ makeArray nx
   RW $ pokeListArray xs px
@@ -239,7 +252,7 @@ fromListP xs = do
 
 -- | Create a new matrix from a list of lists. The matrix is loaded in
 -- /column major/ format!
-fromListsP :: Storable a => [[a]] -> RW s (MatP s a)
+fromListsP :: Storable a => [[a]] -> RW s (MatP s m n a)
 fromListsP xs = do
   pa <- RW $ makeArray ntot
   RW $ pokeListArray (concat xs) pa
@@ -253,13 +266,13 @@ fromListsP xs = do
       else error "fromLists: Not all rows have the same length"
 
 -- | Read the elements of a vector into a list.
-toListP :: CNum e => VecP t e -> RW s [e]
+toListP :: CNum e => VecP t n e -> RW s [e]
 toListP (VecP px nx 1) = RW $ peekListArray nx px
 toListP v = makeCopyVecP v >>= toListP
 
 -- | Read the elements of a matrix into a list of lists in column-major
 -- format.
-toListsP :: Storable a => MatP t a -> RW s [[a]]
+toListsP :: Storable a => MatP t m n a -> RW s [[a]]
 toListsP c@(MatP pa (m,n) lda) = 
   if m == lda 
     then RW . fmap (chunksOf m) $ peekListArray (m*n) pa
@@ -267,39 +280,39 @@ toListsP c@(MatP pa (m,n) lda) =
 
 -- | View the diagonal of a matrix as a vector. Note that this
 -- does not make a copy (as is evident from the type)!
-takeDiagP :: MatP s e -> VecP s e
+takeDiagP :: MatP s n n e -> VecP s n e
 takeDiagP a@(MatP pa (ma,na) lda) = let n' = min ma na in 
   VecP pa n' (lda + 1)
 
 -- | Make a new vector of a given length. Elements remain unitialized.
-makeVecP :: Storable a => Int -> RW s (VecP s a)
+makeVecP :: Storable a => Int -> RW s (VecP s n a)
 makeVecP n = do
   p <- RW $ makeArray n
   return (VecP p n 1)
 
 -- | Set all of the elements in a matrix to 0.
-setZeroMatP :: CNum a => MatP s a -> RW s ()
+setZeroMatP :: CNum a => MatP s m n a -> RW s ()
 setZeroMatP a = geam 0 (a, N) 0 (a, N) a
 
 -- | Make a copy of a vector.
-makeCopyVecP :: (Storable a, C.Cublas a) => VecP t a -> RW s (VecP s a)
+makeCopyVecP :: (Storable a, C.Cublas a) => VecP t n a -> RW s (VecP s n a)
 makeCopyVecP (VecP px nx incx) = do
   py <- RW $ makeArray nx
   RW $ C.copy handle nx px incx py 1
   return $ VecP py nx 1
 
 -- | Cholesky decomposition of a positive-definite matrix.
-potrf :: CNum a => (MatP s a, FillMode) -> RW s ()
+potrf :: CNum a => (MatP s n n a, FillMode) -> RW s ()
 potrf (MatP pa (n,n') lda, fill) = dimCheck "potrf" [[n, n']] $ do
-  (_,res) <- magmaHandle `seq` RW $ Magma.potrf (toChar fill) n pa lda
+  (_,res) <- magmaHandle `seq` RW $ Magma.potrf (toMagma fill) n pa lda
   return $ if res /= 0 then error "Mutable.potrf: MAGMA potrf failed" else ()
   where
-  toChar Upper = 'U'
-  toChar Lower = 'L'
+  toMagma Upper = Magma.Upper
+  toMagma Lower = Magma.Lower
 
 -- | General matrix-matrix linear system solver.
 -- Warning! 'gesv' acts destructively on /both/ matrices.
-gesv :: CNum a => MatP s a -> MatP s a -> RW s ()
+gesv :: CNum a => MatP s n n a -> MatP s n m a -> RW s ()
 gesv (MatP pa (n,n') lda) (MatP pb (n'', m) ldb) = 
   dimCheck "gesv" [[n, n', n'']] $ do
     (_,res) <- magmaHandle `seq` RW $ 
@@ -310,15 +323,16 @@ gesv (MatP pa (n,n') lda) (MatP pb (n'', m) ldb) =
       else ()
 
 -- | Solution of a triangular linear system against a vector.
-trsv :: CNum a => (MatP t a, FillMode, Operation, DiagType)
-     -> VecP s a -> RW s ()
+trsv :: CNum a => (MatP t n n a, FillMode, Operation, DiagType)
+     -> VecP s n a -> RW s ()
 trsv (MatP pa (n,n') lda, uplo, transa, diag) (VecP px nx incx) = 
   dimCheck "trsv" [[n, n', nx]] . RW $
     C.trsv handle uplo transa diag n pa lda px incx
 
 -- | Solution of a triangular linear system against a matrix.
-trsm :: CNum a => (MatP t a, SideMode, FillMode, Operation, DiagType)
-     -> a -> MatP s a -> RW s ()
+-- XXX: make this type more specific
+trsm :: CNum a => (MatP t n n a, SideMode, FillMode, Operation, DiagType)
+     -> a -> MatP s m p a -> RW s ()
 trsm (MatP pa (ma,na) lda, side, uplo, transa, diag) alpha
      (MatP px (m, n) ldb) = 
   dimCheck "trsm" [[ma,na,n']] . RW $
@@ -327,8 +341,9 @@ trsm (MatP pa (ma,na) lda, side, uplo, transa, diag) alpha
   n' = if side == SideLeft then m else n
 
 -- | Matrix-vector multiplication.
-gemv :: CNum a => a -> (MatP t a, Operation) -> VecP u a 
-     -> a -> VecP s a -> RW s ()
+-- XXX: Give this a more specific type
+gemv :: CNum a => a -> (MatP t m n a, Operation) -> VecP u nx a 
+     -> a -> VecP s ny a -> RW s ()
 gemv alpha (MatP pa (m,n) lda, transa) (VecP px nx incx) 
      beta                              (VecP py ny incy) = 
   dimCheck "gemv" [[nx, n'], [ny, m']] . RW $ 
@@ -336,8 +351,9 @@ gemv alpha (MatP pa (m,n) lda, transa) (VecP px nx incx)
   where (m', n') = if transa == N then (m, n) else (n, m)
 
 -- | Matrix-matrix multiplication.
-gemm :: CNum a => a -> (MatP t a, Operation) -> (MatP u a, Operation) 
-     -> a -> MatP s a -> RW s ()
+-- XXX : Give this a more specific type
+gemm :: CNum a => a -> (MatP t ma na a, Operation) -> (MatP u mb nb a, Operation) 
+     -> a -> MatP s m' n' a -> RW s ()
 gemm alpha (MatP pa (ma, na) lda, transa) (MatP pb (mb, nb) ldb, transb)
       beta (MatP pc (m', n') ldc) = 
   dimCheck "gemm" [[m, m'], [k, k'], [n, n']] . RW $
@@ -346,17 +362,18 @@ gemm alpha (MatP pa (ma, na) lda, transa) (MatP pb (mb, nb) ldb, transb)
   (m ,k) = if transa == N then (ma, na) else (na, ma)
   (k',n) = if transb == N then (mb, nb) else (nb, mb)
 
--- Symmetric matrix-vector multiplication.
-symv :: CNum a => (MatP t a, FillMode) -> a -> VecP u a 
-     -> a -> VecP s a -> RW s ()
+-- | Symmetric matrix-vector multiplication.
+symv :: CNum a => (MatP t n n a, FillMode) -> a -> VecP u n a 
+     -> a -> VecP s n a -> RW s ()
 symv (MatP pa (n,n') lda, uplo) alpha (VecP px nx incx)
      beta (VecP py ny incy) = 
   dimCheck "symv" [[n,n',nx,ny]] . RW $
     C.symv handle uplo n alpha pa lda px incx beta py incy
 
 -- | Symmetric low-rank addition.
-syrk :: CNum a => (MatP t a, Operation) -> a -> a 
-     -> (MatP s a, FillMode) -> RW s ()
+-- XXX: Give this a more specific type
+syrk :: CNum a => (MatP t ma na a, Operation) -> a -> a 
+     -> (MatP s mb nb a, FillMode) -> RW s ()
 syrk (MatP pa (ma,na) lda, transa) alpha beta
      (MatP pc (n ,n') ldc, uplo) =
   dimCheck "syrk" [[n,n'], [na, na']] . RW $ 
@@ -366,29 +383,30 @@ syrk (MatP pa (ma,na) lda, transa) alpha beta
   na' = if transa == N then k else n
 
 -- | Vector dot product.
-dot :: CNum a => VecP t a -> VecP u a -> RW s a
+dot :: CNum a => VecP t n a -> VecP u n a -> RW s a
 dot (VecP px nx incx) (VecP py ny incy) = dimCheck "dot" [[nx,ny]] . RW $
   C.dot handle nx px incx py incy
 
 -- | Symmetric rank-1 addition.
-ger :: CNum a => a -> VecP t a -> VecP u a -> MatP s a -> RW s ()
+ger :: CNum a => a -> VecP t m a -> VecP u n a -> MatP s m n a -> RW s ()
 ger alpha (VecP px mx incx) (VecP py ny incy) (MatP pa (m,n) lda) =
   dimCheck "ger" [[mx, m], [ny, n]] . RW $
     C.ger handle m n alpha px incx py incy pa lda
 
 -- | Scalar multiplication for vectors.
-scal :: CNum a => a -> VecP s a -> RW s ()
+scal :: CNum a => a -> VecP s n a -> RW s ()
 scal alpha (VecP px nx incx) = RW $ C.scal handle nx alpha px incx
 
 -- | Combined scalar multiplication of and vector addition to a vector.
-axpy :: CNum a => a -> VecP t a -> VecP s a -> RW s ()
+axpy :: CNum a => a -> VecP t n a -> VecP s n a -> RW s ()
 axpy alpha (VecP px nx incx) (VecP py ny incy) = 
   dimCheck "axpy" [[nx,ny]] . RW $
     C.axpy handle nx alpha px incx py incy
 
 -- | General addition of matrices.
-geam :: CNum a => a -> (MatP t a, Operation) 
-     -> a -> (MatP u a, Operation) -> MatP s a -> RW s ()
+-- XXX : Give this a more specific type
+geam :: CNum a => a -> (MatP t ma na a, Operation) 
+     -> a -> (MatP u mb nb a, Operation) -> MatP s m n a -> RW s ()
 geam alpha (MatP pa (ma, na) lda, transa)
      beta  (MatP pb (mb, nb) ldb, transb) (MatP pc (m, n) ldc) = 
   dimCheck "geam" [[m, m', m''], [n, n', n'']] . RW $
@@ -398,8 +416,9 @@ geam alpha (MatP pa (ma, na) lda, transa)
   (m'', n'') = if transb == N then (mb,nb) else (nb,mb)
 
 -- | Multiplication of a matrix by a diagonal matrix.
-dgmm :: CNum a => SideMode -> VecP t a -> MatP u a
-     -> MatP s a -> RW s ()
+-- XXX: Give this a more specific type
+dgmm :: CNum a => SideMode -> VecP t nx a -> MatP u m n a
+     -> MatP s m n a -> RW s ()
 dgmm mode (VecP px nx incx) (MatP pa (m ,n ) lda)
                             (MatP pc (m',n') ldc) = 
   dimCheck "dgmm" [[m, m'], [n,n'], [nx, vecl]] . RW $
@@ -409,7 +428,7 @@ dgmm mode (VecP px nx incx) (MatP pa (m ,n ) lda)
 
 
 -- | Make a transposed copy of a matrix.
-memtrans :: CNum a => MatP t a -> RW s (MatP s a)
+memtrans :: CNum a => MatP t m n a -> RW s (MatP s n m a)
 memtrans a@(MatP _ (m,n) _) = do
   b <- makeMatP (n,m)
   geam 1 (a, T) 0 (b, N) b
@@ -417,19 +436,19 @@ memtrans a@(MatP _ (m,n) _) = do
 
 -- | Treat a matrix as one gigantic vector (throws an error if the leading
 -- dimension is larger than the number of rows).
-asVecP :: MatP s a -> VecP s a
+asVecP :: MatP s m n a -> VecP s (m * n) a
 asVecP (MatP pa (m,n) lda) = if m == lda 
   then VecP pa (m * n) 1 
   else error "asVecP: not yet defined"
 
 -- | Produce a list of views of each of the columns of a matrix.
-asColumns :: Storable a => MatP s a -> [VecP s a]
+asColumns :: Storable a => MatP s m n a -> [VecP s m a]
 asColumns (MatP pa (m,n) lda) =
   [ VecP (advanceDevPtr pa (i * lda)) m 1 | i <- [0 .. n - 1] ]
 
 -- | Copy each vector in a list into a contiguous matrix.
 fillWithColumns :: (Storable a, C.Cublas a) =>
-    [VecP t a] -> MatP s a -> RW s ()
+    [VecP t m a] -> MatP s m n a -> RW s ()
 fillWithColumns [] _ = return ()
 fillWithColumns (vec : vs) (MatP pa (m,n) lda) = do
   copy vec (VecP pa m 1)

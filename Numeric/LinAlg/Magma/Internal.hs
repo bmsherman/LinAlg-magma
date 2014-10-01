@@ -1,9 +1,13 @@
+{-# LANGUAGE DataKinds, KindSignatures, GADTs, TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE Rank2Types #-}
+
 {- | This module uses the mutable interface to provide an immutable,
 purely functional interface for matrix computations on the GPU. Because
 most of these functions are part of the LinAlg interface, there are not
 documented here. -}
 
-module Numeric.LinAlg.Magma.Internal (
+module Numeric.LinAlg.Magma.Internal {-(
   -- * Data types
   Matrix (..),
 
@@ -33,7 +37,7 @@ module Numeric.LinAlg.Magma.Internal (
   -- ** Other functions
   constant, constantM, trsymprod
 
-) where
+)-} where
 
 import Control.Applicative ((<$>))
 import Control.Monad (forM_)
@@ -47,242 +51,296 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
 
 import Foreign.CUDA.Cublas.Types
-import qualified Foreign.CUDA.Magma as Magma
+
+import GHC.TypeLits
 
 import System.IO.Unsafe (unsafePerformIO)
 
+import Numeric.LinAlg (Dim (..))
 import Numeric.LinAlg.Magma.Mutable hiding (dim, ld)
+
+data SBool (b :: Bool) where 
+  STrue  :: SBool True
+  SFalse :: SBool False
+
+type family Flip (t :: Bool) (m :: Nat) (n :: Nat) :: Nat where
+  Flip True  m n = n
+  Flip False m n = m
 
 -- | An immutable matrix datatype with a transpose flag, so we can avoid
 -- unnecessary transposition.
-data Matrix a = Matrix {
-  payload :: Mat a, 
-  trns :: Bool
-  }
+data GArr :: Dim -> * -> * where
+  Matrix :: !(Mat m n a) -> !(SBool b) -> GArr (M (Flip b m n) (Flip b n m)) a
+  Vector :: !(Vec n a) -> GArr (V n) a
+
+type Matrix m n = GArr (M m n)
+type Vector n = GArr (V n)
 
 -- | Matrix transpose.
-trans :: Matrix a -> Matrix a
-trans (Matrix p t) = Matrix p (not t)
+trans :: Matrix m n a -> Matrix n m a
+trans (Matrix p STrue) = Matrix p SFalse
+trans (Matrix p SFalse) = Matrix p STrue
 
-trOp :: Matrix a -> Operation
-trOp = transOp . trns
+trOp :: Matrix m n a -> Operation
+trOp (Matrix _ STrue) = T
+trOp (Matrix _ SFalse) = N
 
-transOp :: Bool -> Operation
-transOp True = T
-transOp False = N
+sbool :: SBool b -> Bool
+sbool (STrue) = True
+sbool (SFalse) = False
+
+transOp :: SBool b -> Operation
+transOp STrue = T
+transOp SFalse = N
 
 -- | Dimension of a matrix (rows, columns).
-mdim :: Matrix a -> (Int, Int)
-mdim (Matrix (MatP _ (m,n) _) t) = if t then (n,m) else (m,n)
+mdim :: Matrix m n a -> (Int, Int)
+mdim (Matrix (MatP _ (m,n) _) t) = if sbool t then (n,m) else (m,n)
 
-mrows, mcols :: Matrix a -> Int
+mrows, mcols :: Matrix m n a -> Int
 mrows = fst . mdim
 mcols = snd . mdim
 
-fromList :: CNum e => [e] -> Vec e
-fromList xs = makeRW $ fromListP xs
+fromList :: CNum e => [e] -> Vector n e
+fromList xs = Vector $ makeRWV $ fromListP xs
 
-toList :: CNum e => Vec e -> [e]
-toList x = runRW $ toListP x
+toList :: CNum e => Vector n e -> [e]
+toList (Vector x) = runRW $ toListP x
 
 -- | In line with the LinAlg specification, this function accepts
 -- input in /row-major/ format.
-fromLists :: Storable a => [[a]] -> Matrix a
-fromLists xs = Matrix (makeRW $ fromListsP (transpose xs)) False
+fromLists :: Storable a => [[a]] -> Matrix m n a
+fromLists xs = Matrix (makeRWM $ fromListsP (transpose xs)) SFalse
 
 -- | Converts a matrix to a list of lists in /row-major/ format.
-toLists :: CNum a => Matrix a -> [[a]]
-toLists a@(Matrix pa ta) = if ta then runRW $ toListsP pa else toLists (memtrans' a)
+toLists :: CNum a => Matrix m n a -> [[a]]
+toLists (Matrix pa STrue) = runRW $ toListsP pa 
+toLists a@(Matrix _ SFalse) = toLists (memtrans' a)
 
-mXm :: CNum e => Matrix e -> Matrix e -> Matrix e
+mXm :: CNum e => Matrix m n e -> Matrix n p e -> Matrix m p e
 mXm a@(Matrix pa t) b@(Matrix pb t') = dimCheck "mXm" [[k,k']] $ 
-  Matrix p False
+  Matrix p SFalse
   where
-  p = creating (makeMatP (m,n)) $ \pc ->
+  p = creatingM (makeMatP (m,n)) $ \pc ->
     gemm 1 (pa, transOp t) (pb, transOp t') 0 pc
   (m ,k) = mdim a
   (k',n) = mdim b
 
-mXv :: CNum e => Matrix e -> Vec e -> Vec e
-mXv a@(Matrix pa t) x = dimCheck "mXv" [[n, len x]] $
-  creating (makeVecP m) $ \y ->
+mXv :: CNum e => Matrix m n e -> Vector n e -> Vector m e
+mXv a@(Matrix pa t) (Vector x) = dimCheck "mXv" [[n, len x]] . Vector $
+  creatingV (makeVecP m) $ \y ->
     gemv 1 (pa, transOp t) x 0 y
   where
   (m,n) = mdim a
 
 vXm x a = mXv (trans a) x
 
-(.+), (.-) :: CNum e => Matrix e -> Matrix e -> Matrix e
+(.+), (.-) :: CNum e => Matrix m n e -> Matrix m n e -> Matrix m n e
 (.+) = addScale 1
 (.-) = addScale (-1)
 
-(.*) :: CNum e => e -> Matrix e -> Matrix e
+(.*) :: CNum e => e -> Matrix m n e -> Matrix m n e
 k .* a@(Matrix pa t) = Matrix pb t where
-  pb = creating (makeCopyMatP pa) $ \p ->
+  pb = creatingM (makeCopyMatP pa) $ \p ->
     scal k (asVecP p)
 
-trsymprod :: CNum e => Matrix e -> Matrix e -> e
-trsymprod a@(Matrix pa ta) b@(Matrix pb tb) =
-  if ta==tb 
-    then runRW $ dot (asVecP pa) (asVecP pb)
-    else trsymprod a (memtrans' b)
+trsymprod :: CNum e => Matrix n n e -> Matrix n n e -> e
+trsymprod = sameTrans1 f where
+  f pa pb = runRW $ dot (asVecP pa) (asVecP pb)
 
+sameTrans1 :: CNum e => (forall i. forall j. Mat i j e -> Mat i j e -> a)
+                     -> Matrix m n e -> Matrix m n e -> a
+sameTrans1 f (Matrix a STrue) (Matrix b STrue) = f a b
+sameTrans1 f (Matrix a SFalse) (Matrix b SFalse) = f a b
+sameTrans1 f (Matrix a STrue) (Matrix b SFalse) = f (makeRWM (memtrans a)) b
+sameTrans1 f (Matrix a SFalse) (Matrix b STrue) = f a (makeRWM (memtrans b))
+
+sameTrans :: CNum e => (forall i. forall j. Mat i j e -> Mat i j e -> Mat i j e)
+          ->  Matrix m n e -> Matrix m n e -> Matrix m n e
+sameTrans f (Matrix pa STrue) (Matrix pb STrue) = Matrix (f pa pb) STrue
+sameTrans f (Matrix pa SFalse) (Matrix pb SFalse) = Matrix (f pa pb) SFalse
+sameTrans f (Matrix pa STrue) (Matrix pb SFalse) = 
+  Matrix (f (makeRWM (memtrans pa)) pb) SFalse
+sameTrans f (Matrix pa SFalse) (Matrix pb STrue) =
+  Matrix (f pa (makeRWM (memtrans pb))) SFalse
 
 -- | Switch between row-major and column-major storage. That is, the matrix
 -- is transposed in memory, but /not/ logically.
-memtrans' :: CNum e => Matrix e -> Matrix e
-memtrans' a@(Matrix pa ta) = Matrix pa' (not ta) where
-  pa' = makeRW $ memtrans pa 
+memtrans' :: CNum e => Matrix m n e -> Matrix m n e
+memtrans' (Matrix pa STrue)  = Matrix (makeRWM (memtrans pa)) SFalse
+memtrans' (Matrix pa SFalse) = Matrix (makeRWM (memtrans pa)) STrue
 
 
 -- | addScale beta a b = a + beta*b
-addScale :: CNum e => e -> Matrix e -> Matrix e -> Matrix e
-addScale beta a@(Matrix pa ta) b@(Matrix pb tb) = Matrix pc False where
-  pc = creating (makeMatP (mdim a)) $ \p ->
+addScale :: CNum e => e -> Matrix m n e -> Matrix m n e -> Matrix m n e
+addScale beta a@(Matrix pa ta) b@(Matrix pb tb) = Matrix pc SFalse where
+  pc = creatingM (makeMatP (mdim a)) $ \p ->
     geam 1 (pa, transOp ta) beta (pb, transOp tb) p
 
 -- | General linear solver
-genSolveV :: CNum e => Matrix e -> Vec e -> Vec e
-genSolveV a@(Matrix pa tra) b = 
-  creating (makeCopyVecP b) $ \(VecP px n 1) -> do
-    pa' <- makeCopy tra pa
+genSolveV :: CNum e => Matrix n n e -> Vector n e -> Vector n e
+genSolveV a (Vector b) = Vector $ 
+  creatingV (makeCopyVecP b) $ \(VecP px n 1) -> do
+    pa' <- makeCopy a
     gesv pa' (MatP px (n, 1) n)
-  where
-  makeCopy trbool = if trbool then memtrans else makeCopyMatP
+
+
+makeCopy :: CNum e => Matrix m n e -> RW s (MatP s m n e)
+makeCopy (Matrix pa STrue) = memtrans pa
+makeCopy (Matrix pa SFalse) = makeCopyMatP pa
 
 -- | General linear solver
-genSolveM :: CNum e => Matrix e -> Matrix e -> Matrix e
-genSolveM a@(Matrix pa tra) b@(Matrix pb trb) = Matrix px False
+genSolveM :: CNum e => Matrix n n e -> Matrix n p e -> Matrix n p e
+genSolveM a b = Matrix px SFalse
   where
-  makeCopy trbool = if trbool then memtrans else makeCopyMatP
-  px = creating (makeCopy trb pb) $ \pb -> do
-    pa' <- makeCopy tra pa
+  px = creatingM (makeCopy b) $ \pb -> do
+    pa' <- makeCopy a
     gesv pa' pb
   
 -- | Solution of a triangular system.
-tSolveM :: CNum e => FillMode -> SideMode -> Matrix e -> Matrix e -> Matrix e
-tSolveM fill side u b@(Matrix _ True) = 
+-- XXX: make the type more specific
+tSolveM :: CNum e => FillMode -> SideMode -> Matrix n n e -> Matrix m p e -> Matrix m p e
+tSolveM fill side u b@(Matrix _ STrue) = 
   trans $ tSolveM (flip fill) (swap side) (trans u) (trans b) where
   flip Upper = Lower
   flip Lower = Upper
   swap SideLeft = SideRight
   swap SideRight = SideLeft
-tSolveM fill side a@(Matrix pa ta) b@(Matrix pb False) = Matrix px False where
-  px = creating (makeCopyMatP pb) $ \p ->
-    trsm (pa, side, actfill fill, transOp ta, NonUnit) 1 p
+tSolveM fill side a@(Matrix pa STrue) b@(Matrix pb SFalse) = 
+  Matrix px SFalse
+  where
+  px = creatingM (makeCopyMatP pb) $ \p ->
+    trsm (pa, side, flip fill, transOp STrue, NonUnit) 1 p
   flip Upper = Lower
   flip Lower = Upper
-  actfill = if ta then flip else id
+tSolveM fill side a@(Matrix pa SFalse) b@(Matrix pb SFalse) = Matrix px SFalse
+  where
+  px = creatingM (makeCopyMatP pb) $ \p ->
+    trsm (pa, side, fill, transOp SFalse, NonUnit) 1 p
 
 -- | Solution of a triangular system.
-tSolveV :: CNum e => FillMode -> Matrix e -> Vec e -> Vec e
-tSolveV fill a@(Matrix pa ta) b = creating (makeCopyVecP b) $ \x ->
-  trsv (pa, actfill fill, transOp ta, NonUnit) x
+tSolveV :: CNum e => FillMode -> Matrix n n e -> Vec n e -> Vec n e
+tSolveV fill a@(Matrix pa STrue) b = creatingV (makeCopyVecP b) $ \x ->
+  trsv (pa, flip fill, transOp STrue, NonUnit) x
   where
   flip Upper = Lower
   flip Lower = Upper
-  actfill = if ta then flip else id
+tSolveV fill a@(Matrix pa SFalse) b = creatingV (makeCopyVecP b) $ \x ->
+  trsv (pa, fill, transOp SFalse, NonUnit) x
 
 -- | Cholesky decomposition.
 -- __Important Note__: The entries above the diagonal are *not* zeroed
 -- out, so be careful!
-chol :: CNum e => Matrix e -> Matrix e
-chol a@(Matrix pa ta) = magmaHandle `seq` Matrix pl ta where
-  pl = creating (makeCopyMatP pa) $ \p -> 
-    potrf (p, fill)
-  fill = if ta then Upper else Lower
+chol :: CNum e => Matrix n n e -> Matrix n n e
+chol (Matrix pa STrue) = magmaHandle `seq` Matrix pl STrue where
+  pl = creatingM (makeCopyMatP pa) $ \p -> 
+    potrf (p, Upper)
+chol (Matrix pa SFalse) = magmaHandle `seq` Matrix pl SFalse where
+  pl = creatingM (makeCopyMatP pa) $ \p -> 
+    potrf (p, Lower)
 
-(^\), (.\) :: CNum e => Matrix e -> Matrix e -> Matrix e
+--fill SFalse = Lower
+
+(^\), (.\) :: CNum e => Matrix n n e -> Matrix n p e -> Matrix n p e
 (^\) = tSolveM Upper SideLeft
 (.\) = tSolveM Lower SideLeft
 
-vminus, vplus :: CNum e => Vec e -> Vec e -> Vec e
+vminus, vplus :: CNum e => Vector n e -> Vector n e -> Vector n e
 vminus = flip $ vAddScale (-1) 
 vplus = flip $ vAddScale 1
 
-asColMat :: CNum e => Vec e -> Matrix e
-asColMat v = Matrix (asColMatP v) False
+asColMat :: CNum e => Vec n e -> Matrix n 1 e
+asColMat v = Matrix (asColMatP v) SFalse
 
-asColVec :: CNum e => Matrix e -> Vec e
-asColVec a@(Matrix pa ta) = if ta
-  then asColVec (memtrans' a)
-  else asColVecP pa
+asColVec :: CNum e => Matrix m n e -> Vec (m * n) e
+asColVec a@(Matrix _ STrue) = asColVec (memtrans' a)
+asColVec (Matrix pa SFalse) = asColVecP pa
 
-asColMatP :: CNum e => Vec e -> Mat e
+asColMatP :: CNum e => Vec n e -> Mat n 1 e
 asColMatP (VecP px n 1) = MatP px (n,1) n
-asColMatP v = asColMatP $ makeRW (makeCopyVecP v)
+asColMatP v = asColMatP $ makeRWV (makeCopyVecP v)
 
-asColVecP :: CNum e => Mat e -> Vec e
+asColVecP :: CNum e => Mat m n e -> Vec (m * n) e
 asColVecP a@(MatP px (m,n) lda) = if m == lda
   then VecP px (m*n) 1
-  else asColVecP $ makeRW (makeCopyMatP a)
+  else asColVecP $ makeRWM (makeCopyMatP a)
 
-outer :: CNum e => Vec e -> Vec e -> Matrix e
-outer u v = Matrix pa False where
-  pa = creating (makeMatP (len u, len v)) $ \p -> do
+outer :: CNum e => Vec m e -> Vec n e -> Matrix m n e
+outer u v = Matrix pa SFalse where
+  pa = creatingM (makeMatP (len u, len v)) $ \p -> do
     setZeroMatP p
     ger 1 u v p
 
-vscal :: CNum e => e -> Vec e -> Vec e
-vscal alpha v = creating (makeCopyVecP v) $ \y -> 
+vscal :: CNum e => e -> Vector n e -> Vector n e
+vscal alpha (Vector v) = Vector $ creatingV (makeCopyVecP v) $ \y -> 
   scal alpha y
 
-vAddScale :: CNum e => e -> Vec e -> Vec e -> Vec e
-vAddScale alpha x y = creating (makeCopyVecP y) $ \z ->
-  axpy alpha x z
+vAddScale :: CNum e => e -> Vector n e -> Vector n e -> Vector n e
+vAddScale alpha (Vector x) (Vector y) = Vector $
+  creatingV (makeCopyVecP y) $ \z ->
+    axpy alpha x z
 
-elementwiseProdV :: CNum e => Vec e -> Vec e -> Vec e
-elementwiseProdV (VecP px nx incx) y@(VecP py ny incy) = 
+elementwiseProdVP :: CNum e => Vec n e -> Vec n e -> Vec n e
+elementwiseProdVP (VecP px nx incx) y@(VecP py ny incy) = 
   dimCheck "elementwiseProdV" [[nx, ny]] $
-   creating (makeVecP nx) $ \z@(VecP pz nz incz) ->
+   creatingV (makeVecP nx) $ \z@(VecP pz nz incz) ->
      dgmm SideRight y (MatP px (1,nx) incx) (MatP pz (1,nz) incz)
 
-elementwiseProdM :: CNum e => Matrix e -> Matrix e -> Matrix e
-elementwiseProdM a@(Matrix pa ta) b@(Matrix pb tb) = 
-  dimCheck "elementwiseProdM" [[mdim a, mdim b]] $
-    if ta == tb
-      then 
-        let (m,n) = mdim b
-            [a', b'] = map asColVec [a, b]
-            (VecP pc _ 1) = elementwiseProdV a' b'
-        in (Matrix (MatP pc (m,n) m) False)
-      else elementwiseProdM a (memtrans' b)
 
-ident :: CNum e => Int -> Matrix e
+elementwiseProdV :: CNum e => Vector n e -> Vector n e -> Vector n e
+elementwiseProdV (Vector u) (Vector v) = Vector (elementwiseProdVP u v)
+
+elementwiseProdM :: CNum e => Matrix m n e -> Matrix m n e -> Matrix m n e
+elementwiseProdM = sameTrans f
+  where
+  f pa@(MatP _ dima@(m, n) _) pb@(MatP _ dimb _) =
+    dimCheck "elementwiseProdM" [[dima, dimb]] $
+       let [pa', pb'] = map asColVecP [pa, pb]
+	   VecP pc _ 1 = elementwiseProdVP pa' pb'
+       in MatP pc (m,n) m
+
+ident :: CNum e => Int -> Matrix n n e
 ident n = fromDiag (constant 1 n)
 
-fromDiag :: CNum e => Vec e -> Matrix e
-fromDiag v = Matrix payload False where
-  payload = creating (makeMatP (n,n)) $ \a@(MatP pa _ lda) -> do
+fromDiag :: CNum e => Vector n e -> Matrix n n e
+fromDiag (Vector v) = Matrix payload SFalse where
+  payload = creatingM (makeMatP (n,n)) $ \a@(MatP pa _ lda) -> do
     setZeroMatP a
     copy v (VecP pa n (lda + 1))
   n = len v
 
-takeDiag' :: CNum e => Matrix e -> Vec e
-takeDiag' (Matrix pa _) = takeDiagP pa
+takeDiag' :: CNum e => Matrix n n e -> Vector n e
+takeDiag' (Matrix pa STrue)  = Vector $ takeDiagP pa
+takeDiag' (Matrix pa SFalse) = Vector $ takeDiagP pa
 
-toColumns :: CNum e => Matrix e -> [Vec e]
-toColumns mat@(Matrix payload trans) = if trans
-  then toColumns (memtrans' mat)
-  else asColumns payload
+toColumns :: CNum e => Matrix m n e -> [Vector m e]
+toColumns mat@(Matrix payload STrue) = toColumns (memtrans' mat)
+toColumns (Matrix payload SFalse) = map Vector $ asColumns payload
 
-toRows :: CNum e => Matrix e -> [Vec e]
+toRows :: CNum e => Matrix m n e -> [Vector n e]
 toRows = toColumns . trans
 
-fromColumns :: CNum e => [Vec e] -> Matrix e
-fromColumns vs@(v : _) = Matrix payload False where
-  payload = creating (makeMatP (m,n)) $ fillWithColumns vs
+fromColumns :: CNum e => [Vector m e] -> Matrix m n e
+fromColumns vs@(Vector v : _) = Matrix payload SFalse where
+  payload = creatingM (makeMatP (m,n)) $ 
+    fillWithColumns (unVector vs)
   m = len v
   n = length vs
+  unVector :: [Vector n e] -> [Vec n e]
+  unVector [] = []
+  unVector (Vector v : vs) = v : unVector vs
 
-fromRows :: CNum e => [Vec e] -> Matrix e
+fromRows :: CNum e => [Vector n e] -> Matrix m n e
 fromRows = trans . fromColumns
 
-constant :: CNum a => a -> Int -> Vec a
-constant alpha n = makeRW $ do
+constant :: CNum a => a -> Int -> Vector n a
+constant alpha n = Vector (constantP alpha n)
+
+constantP :: CNum a => a -> Int -> Vec n a
+constantP alpha n = makeRWV $ do
   (VecP px _ _) <- fromListP [alpha]
   return (VecP px n 0)
 
-constantM :: CNum a => a -> (Int, Int) -> Matrix a
-constantM alpha (m,n) = Matrix (MatP pa (m,n) 0) False where
-  (VecP pa _ 1) = makeRW $ makeCopyVecP (constant alpha m)
+constantM :: CNum a => a -> (Int, Int) -> Matrix m n a
+constantM alpha (m,n) = Matrix (MatP pa (m,n) 0) SFalse where
+  (VecP pa _ 1) = makeRWV $ makeCopyVecP (constantP alpha m)

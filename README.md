@@ -4,7 +4,7 @@ LinAlg-magma
 LinAlg-magma provides a GPU-powered backend for the Haskell library
 [LinAlg](https://github.com/bmsherman/LinAlg/). Therefore, it allows
 execution of purely functional numerical linear algebra operations
-on the GPU.
+on the GPU. Matrix and vector sizes are checked statically.
 
 Additionally, a mutable interface is provided (at a higher level of 
 abstraction than the FFI bindings) which can be used in conjunction with
