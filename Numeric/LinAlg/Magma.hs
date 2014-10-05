@@ -4,7 +4,8 @@
 module Numeric.LinAlg.Magma (
   module Numeric.LinAlg,
   module Numeric.LinAlg.Magma,
-  C.Matrix (..), C.Vec (..), CFloat (..), CDouble (..)
+  GArr (..), Matrix, Vector,
+  CFloat (..), CDouble (..)
  ) where
 import Numeric.LinAlg
 import Foreign.C.Types (CFloat (..), CDouble (..))

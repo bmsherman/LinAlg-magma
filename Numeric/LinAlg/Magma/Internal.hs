@@ -7,9 +7,9 @@ purely functional interface for matrix computations on the GPU. Because
 most of these functions are part of the LinAlg interface, there are not
 documented here. -}
 
-module Numeric.LinAlg.Magma.Internal {-(
+module Numeric.LinAlg.Magma.Internal (
   -- * Data types
-  Matrix (..),
+  GArr (..), Matrix, Vector, 
 
   -- * LinAlg operations
   -- ** Data transfer
@@ -37,7 +37,7 @@ module Numeric.LinAlg.Magma.Internal {-(
   -- ** Other functions
   constant, constantM, trsymprod
 
-)-} where
+) where
 
 import Control.Applicative ((<$>))
 import Control.Monad (forM_)
