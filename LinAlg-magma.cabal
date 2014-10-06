@@ -17,8 +17,8 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     Numeric.LinAlg.Magma.Internal
-  --                     Numeric.LinAlg.Magma.Mutable
-  --                     Numeric.LinAlg.Magma
+                       Numeric.LinAlg.Magma.Mutable
+                       Numeric.LinAlg.Magma
   other-extensions:    MultiParamTypeClasses, FlexibleInstances, RankNTypes
   build-depends:       base >=4.4 && <4.8,
                        split >=0.2 && <0.3,

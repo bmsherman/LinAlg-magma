@@ -12,16 +12,16 @@ module Numeric.LinAlg.Magma.Mutable (
 
   -- * The read-write monad
   RW,
-  makeRWV, makeRWM, runRW, creatingV, creatingM,
+  makeRWD, makeRWV, makeRWM, runRW, creatingV, creatingM,
   -- * Data types
   CNum (..),
   -- ** Mutable
-  VecP (..), MatP (..),
+  VecP (..), MatP (..), DVecP (..), DMatP (..),
   -- ** Immutable
   Ice, Mat, Vec,
   -- * Data transfer
-  fromListP, fromListsP,
-  toListP, toListsP,
+  fromVectP, fromVectsP,
+  toVectP, toListsP, toVectsP,
   makeVecP, makeMatP,
   copy, makeCopyVecP, makeCopyMatP,
   memtrans, fillWithColumns,
@@ -70,6 +70,10 @@ import qualified Foreign.CUDA.Magma.Types as Magma
 
 import GHC.TypeLits 
 
+import Numeric.LinAlg.SNat (SNat, snat, lit, times, minus)
+import Numeric.LinAlg.Vect (Vect (MkVect))
+import qualified Numeric.LinAlg.Vect as V
+
 import System.Mem.Weak (addFinalizer)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -117,9 +121,9 @@ newtype RW s a = RW { unRW :: IO a } deriving (Functor, Applicative, Monad)
 -- | A type for vectors which reside on the GPU.
 -- The first type argument is a phantom type that is used similarly to the
 -- state type in the 'ST' monad.
-data VecP s (n :: Nat) a = KnownNat n => VecP
+data VecP s (n :: Nat) a = VecP
   { ptrV   :: DevicePtr a -- ^ a pointer to the payload on the GPU
-  , len    :: Proxy n -- ^ the number of elements in the vector
+  , len    :: SNat n -- ^ the number of elements in the vector
   , stride :: Int -- ^ the offset in the payload from one element of the 
                   -- vector to the next
   }
@@ -134,9 +138,9 @@ data DMatP s a where
 -- in column-major format, which is the format preferred by CUBLAS.
 -- The first type argument is a phantom type that is used similarly to the
 -- state type in the 'ST' monad.
-data MatP s (m :: Nat) (n :: Nat) a = (KnownNat m, KnownNat n) => MatP
+data MatP s (m :: Nat) (n :: Nat) a = MatP
   { ptrM :: DevicePtr a -- ^ a pointer to the payload on the GPU
-  , dim  :: (Proxy m, Proxy n) -- ^ the dimensions of the matrix (rows, columns)
+  , dim  :: (SNat m, SNat n) -- ^ the dimensions of the matrix (rows, columns)
   , ld   :: Int -- ^ the leading dimension of the matrix
   }
 
@@ -161,6 +165,9 @@ type Vec = VecP Ice
 -- type variable to 'Ice', indicating that the value is now immutable.
 -- We do /not/ need to make a copy of the mutable value; rather, it
 -- may no longer be mutated.
+makeRWD :: (forall s. RW s (dyn s e)) -> dyn Ice e
+makeRWD (RW x) = unsafePerformIO x
+
 makeRWV :: (forall s. RW s (VecP s n e)) -> Vec n e
 makeRWV (RW x) = unsafePerformIO x
 
@@ -231,16 +238,15 @@ makeCopyArray n pa = do
 
 -- | Make a new matrix on the GPU with given dimensions. Elements are
 -- uninitialized.
-makeMatP :: (KnownNat m, KnownNat n, Storable a) 
-  => (Proxy m, Proxy n) -> RW s (MatP s m n a)
+makeMatP :: Storable a
+  => (SNat m, SNat n) -> RW s (MatP s m n a)
 makeMatP dim@(m,n) = do
   p <- RW $ makeArray (m' * natInt n)
   return $ MatP p dim m'
   where m' = natInt m
 
 -- | Make a copy of a matrix.
-makeCopyMatP :: (Storable a, KnownNat m, KnownNat n) 
-  => MatP t m n a -> RW s (MatP s m n a)
+makeCopyMatP :: Storable a => MatP t m n a -> RW s (MatP s m n a)
 makeCopyMatP (MatP pa dim@(m,n) lda) = 
   if m' == lda 
     then do
@@ -250,8 +256,8 @@ makeCopyMatP (MatP pa dim@(m,n) lda) =
     else error "makeCopyMatP: Not yet implemented"
   where m' = natInt m
 
-natInt :: KnownNat n => Proxy n -> Int
-natInt = fromIntegral . natVal
+natInt :: SNat n -> Int
+natInt = snat
 
 -- | Make a copy of a vector.
 copy :: C.Cublas a => VecP t n a -> VecP s n a -> RW s ()
@@ -259,34 +265,28 @@ copy (VecP px nx incx) (VecP py ny incy) = dimCheck "copy" [[nx,ny]] $
   RW $ C.copy handle (natInt nx) px incx py incy
 
 -- | Create a new vector from a list.
-fromListP :: Storable a => [a] -> RW s (DVecP s a)
-fromListP xs = case someNatVal (fromIntegral nx) of
-  Just (SomeNat n) -> do
-    px <- RW $ makeArray nx
-    RW $ pokeListArray xs px
-    return $ DVecP (VecP px n 1)
-  where nx = length xs
+fromVectP :: Storable a => Vect n a -> RW s (VecP s n a)
+fromVectP xs = do
+    px <- RW $ makeArray (natInt nx)
+    RW $ pokeListArray (V.toList xs) px
+    return (VecP px nx 1)
+  where nx = V.length xs
 
 -- | Create a new matrix from a list of lists. The matrix is loaded in
 -- /column major/ format!
-fromListsP :: Storable a => [[a]] -> RW s (DMatP s a)
-fromListsP xs = case (someNatVal (fromIntegral rows), someNatVal (fromIntegral cols)) of
-  (Just (SomeNat m), Just (SomeNat n)) -> do
-    pa <- RW $ makeArray ntot
-    RW $ pokeListArray (concat xs) pa
-    return $ DMatP (MatP pa (m, n) rows)
+fromVectsP :: Storable a => Vect n (Vect m a) -> RW s (MatP s m n a)
+fromVectsP vect = do
+    pa <- RW $ makeArray (natInt (times m n))
+    RW $ pokeListArray (concat (map V.toList (V.toList vect))) pa
+    return $ MatP pa (m, n) (natInt m)
   where
-  ntot = rows*cols
-  cols = length xs
-  rows = let ls = map length xs in 
-    if and (map (head ls==) ls)
-      then (head ls) 
-      else error "fromLists: Not all rows have the same length"
+  m = V.length (head (V.toList vect))
+  n = V.length vect
 
 -- | Read the elements of a vector into a list.
-toListP :: CNum e => VecP t n e -> RW s [e]
-toListP (VecP px nx 1) = RW $ peekListArray (natInt nx) px
-toListP v = makeCopyVecP v >>= toListP
+toVectP :: CNum e => VecP t n e -> RW s (Vect n e)
+toVectP (VecP px nx 1) = fmap MkVect $ RW (peekListArray (natInt nx) px)
+toVectP v = makeCopyVecP v >>= toVectP
 
 -- | Read the elements of a matrix into a list of lists in column-major
 -- format.
@@ -297,6 +297,10 @@ toListsP c@(MatP pa (m,n) lda) =
     else error "toListsP: Not yet implemented"
   where m' = natInt m
 
+
+toVectsP :: Storable a => MatP t m n a -> RW s (Vect n (Vect m a))
+toVectsP c = fmap (MkVect . map MkVect) (toListsP c)
+
 -- | View the diagonal of a matrix as a vector. Note that this
 -- does not make a copy (as is evident from the type)!
 takeDiagP :: MatP s n n e -> VecP s n e
@@ -304,7 +308,7 @@ takeDiagP a@(MatP pa (ma,na) lda) = let n' = min ma na in
   VecP pa n' (lda + 1)
 
 -- | Make a new vector of a given length. Elements remain unitialized.
-makeVecP :: (KnownNat n, Storable a) => Proxy n -> RW s (VecP s n a)
+makeVecP :: Storable a => SNat n -> RW s (VecP s n a)
 makeVecP n = do
   p <- RW $ makeArray (natInt n)
   return (VecP p n 1)
@@ -476,25 +480,24 @@ memtrans a@(MatP _ (m,n) _) = do
 
 -- | Treat a matrix as one gigantic vector (throws an error if the leading
 -- dimension is larger than the number of rows).
-asVecP :: forall m. forall n. forall s. forall a. KnownNat (m * n) => 
-  MatP s m n a -> VecP s (m * n) a
-asVecP (MatP pa (m',n') lda) = if natInt m' == lda 
-  then VecP pa (Proxy :: Proxy (m * n)) 1 
+asVecP :: MatP s m n a -> VecP s (m * n) a
+asVecP (MatP pa (m,n) lda) = if natInt m == lda 
+  then VecP pa (times m n) 1 
   else error "asVecP: not yet defined"
 
 -- | Produce a list of views of each of the columns of a matrix.
-asColumns :: Storable a => MatP s m n a -> [VecP s m a]
-asColumns (MatP pa (m,n) lda) =
-  [ VecP (advanceDevPtr pa (i * lda)) m 1 | i <- [0 .. natInt n - 1] ]
+asColumns :: Storable a => MatP s m n a -> Vect n (VecP s m a)
+asColumns (MatP pa (m,n) lda) = V.generate n $ \i ->
+  VecP (advanceDevPtr pa (i * lda)) m 1
 
 -- | Copy each vector in a list into a contiguous matrix.
-fillWithColumns :: forall s. forall t. forall m. forall n. forall a.
-  (Storable a, C.Cublas a) =>
+fillWithColumns :: (Storable a, C.Cublas a) =>
     [VecP t m a] -> MatP s m n a -> RW s ()
 fillWithColumns [] _ = return ()
 fillWithColumns (vec : vs) (MatP pa (m,n) lda) = do
   copy vec (VecP pa m 1)
-  fillWithColumns vs (MatP (advanceDevPtr pa lda) (m, Proxy :: Proxy (n-1)) lda)
+  fillWithColumns vs (MatP (advanceDevPtr pa lda) (m, n') lda)
+  where Just n' = minus n (lit (Proxy :: Proxy 1))
 
 -- | For each list that is provided, checks that all of the elemnts in the
 -- list are the same. If not, causes an 'error' which is prefixed by the
