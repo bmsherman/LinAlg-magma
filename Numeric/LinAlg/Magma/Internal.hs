@@ -44,6 +44,7 @@ import Control.Monad (forM_)
 
 import Data.List (foldl', transpose)
 import Data.List.Split (chunksOf)
+import Data.Proxy (Proxy (Proxy))
 
 import Foreign.CUDA
 import Foreign.C.Types (CFloat, CInt (CInt))
@@ -58,6 +59,9 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import Numeric.LinAlg (Dim (..))
 import Numeric.LinAlg.Magma.Mutable hiding (dim, ld)
+import Numeric.LinAlg.SNat (SNat, snat, lit, times)
+import qualified Numeric.LinAlg.Vect as V
+import Numeric.LinAlg.Vect (Vect (MkVect), cons, nil)
 
 data SBool (b :: Bool) where 
   STrue  :: SBool True
@@ -94,28 +98,30 @@ transOp STrue = T
 transOp SFalse = N
 
 -- | Dimension of a matrix (rows, columns).
-mdim :: Matrix m n a -> (Int, Int)
-mdim (Matrix (MatP _ (m,n) _) t) = if sbool t then (n,m) else (m,n)
+mdim :: Matrix m n a -> (SNat m , SNat n)
+mdim (Matrix (MatP _ (m,n) _) STrue) = (n, m)
+mdim (Matrix (MatP _ (m,n) _) SFalse) = (m, n)
 
-mrows, mcols :: Matrix m n a -> Int
+mrows :: Matrix m n a -> SNat m
 mrows = fst . mdim
+mcols :: Matrix m n a -> SNat n 
 mcols = snd . mdim
 
-fromList :: CNum e => [e] -> Vector n e
-fromList xs = Vector $ makeRWV $ fromListP xs
+fromVect :: CNum e => Vect n e -> GArr (V n) e
+fromVect xs = Vector (makeRWV (fromVectP xs))
 
-toList :: CNum e => Vector n e -> [e]
-toList (Vector x) = runRW $ toListP x
+toVect :: CNum e => Vector n e -> Vect n e
+toVect (Vector x) = runRW $ toVectP x
 
 -- | In line with the LinAlg specification, this function accepts
 -- input in /row-major/ format.
-fromLists :: Storable a => [[a]] -> Matrix m n a
-fromLists xs = Matrix (makeRWM $ fromListsP (transpose xs)) SFalse
+fromVects :: Storable a => Vect m (Vect n a) -> GArr (M m n) a 
+fromVects xs = Matrix (makeRWM $ fromVectsP xs) STrue
 
 -- | Converts a matrix to a list of lists in /row-major/ format.
-toLists :: CNum a => Matrix m n a -> [[a]]
-toLists (Matrix pa STrue) = runRW $ toListsP pa 
-toLists a@(Matrix _ SFalse) = toLists (memtrans' a)
+toVects :: CNum a => Matrix m n a -> Vect m (Vect n a)
+toVects (Matrix pa STrue) = runRW $ toVectsP pa 
+toVects a@(Matrix _ SFalse) = toVects (memtrans' a)
 
 mXm :: CNum e => Matrix m n e -> Matrix n p e -> Matrix m p e
 mXm a@(Matrix pa t) b@(Matrix pb t') = dimCheck "mXm" [[k,k']] $ 
@@ -182,7 +188,7 @@ genSolveV :: CNum e => Matrix n n e -> Vector n e -> Vector n e
 genSolveV a (Vector b) = Vector $ 
   creatingV (makeCopyVecP b) $ \(VecP px n 1) -> do
     pa' <- makeCopy a
-    gesv pa' (MatP px (n, 1) n)
+    gesv pa' (MatP px (n, lit (Proxy :: Proxy 1)) (snat n))
 
 
 makeCopy :: CNum e => Matrix m n e -> RW s (MatP s m n e)
@@ -257,12 +263,12 @@ asColVec a@(Matrix _ STrue) = asColVec (memtrans' a)
 asColVec (Matrix pa SFalse) = asColVecP pa
 
 asColMatP :: CNum e => Vec n e -> Mat n 1 e
-asColMatP (VecP px n 1) = MatP px (n,1) n
+asColMatP (VecP px n 1) = MatP px (n,lit (Proxy :: Proxy 1)) (snat n)
 asColMatP v = asColMatP $ makeRWV (makeCopyVecP v)
 
 asColVecP :: CNum e => Mat m n e -> Vec (m * n) e
-asColVecP a@(MatP px (m,n) lda) = if m == lda
-  then VecP px (m*n) 1
+asColVecP a@(MatP px (m,n) lda) = if snat m == lda
+  then VecP px (times m n) 1
   else asColVecP $ makeRWM (makeCopyMatP a)
 
 outer :: CNum e => Vec m e -> Vec n e -> Matrix m n e
@@ -284,7 +290,8 @@ elementwiseProdVP :: CNum e => Vec n e -> Vec n e -> Vec n e
 elementwiseProdVP (VecP px nx incx) y@(VecP py ny incy) = 
   dimCheck "elementwiseProdV" [[nx, ny]] $
    creatingV (makeVecP nx) $ \z@(VecP pz nz incz) ->
-     dgmm SideRight y (MatP px (1,nx) incx) (MatP pz (1,nz) incz)
+     dgmm SideRight y (MatP px (lit one,nx) incx) (MatP pz (lit one,nz) incz)
+  where one = Proxy :: Proxy 1
 
 
 elementwiseProdV :: CNum e => Vector n e -> Vector n e -> Vector n e
@@ -297,9 +304,9 @@ elementwiseProdM = sameTrans f
     dimCheck "elementwiseProdM" [[dima, dimb]] $
        let [pa', pb'] = map asColVecP [pa, pb]
 	   VecP pc _ 1 = elementwiseProdVP pa' pb'
-       in MatP pc (m,n) m
+       in MatP pc (m,n) (snat m)
 
-ident :: CNum e => Int -> Matrix n n e
+ident :: CNum e => SNat n -> Matrix n n e
 ident n = fromDiag (constant 1 n)
 
 fromDiag :: CNum e => Vector n e -> Matrix n n e
@@ -313,34 +320,36 @@ takeDiag' :: CNum e => Matrix n n e -> Vector n e
 takeDiag' (Matrix pa STrue)  = Vector $ takeDiagP pa
 takeDiag' (Matrix pa SFalse) = Vector $ takeDiagP pa
 
-toColumns :: CNum e => Matrix m n e -> [Vector m e]
+toColumns :: CNum e => Matrix m n e -> Vect n (Vector m e)
 toColumns mat@(Matrix payload STrue) = toColumns (memtrans' mat)
-toColumns (Matrix payload SFalse) = map Vector $ asColumns payload
+toColumns (Matrix payload SFalse) = V.map Vector $ asColumns payload
 
-toRows :: CNum e => Matrix m n e -> [Vector n e]
+toRows :: CNum e => Matrix m n e -> Vect m (Vector n e)
 toRows = toColumns . trans
 
-fromColumns :: CNum e => [Vector m e] -> Matrix m n e
-fromColumns vs@(Vector v : _) = Matrix payload SFalse where
-  payload = creatingM (makeMatP (m,n)) $ 
-    fillWithColumns (unVector vs)
+fromColumns :: CNum e => Vect n (Vector m e) -> GArr (M m n) e
+fromColumns vect = Matrix payload SFalse
+  where
+  payload = creatingM (makeMatP (m, n)) $ 
+    fillWithColumns vs
+  vs@(v : _) = unVector (V.toList vect)
+  n = V.length vect
   m = len v
-  n = length vs
   unVector :: [Vector n e] -> [Vec n e]
   unVector [] = []
   unVector (Vector v : vs) = v : unVector vs
 
-fromRows :: CNum e => [Vector n e] -> Matrix m n e
+fromRows :: CNum e => Vect m (Vector n e) -> GArr (M m n) e
 fromRows = trans . fromColumns
 
-constant :: CNum a => a -> Int -> Vector n a
+constant :: CNum a => a -> SNat n -> Vector n a
 constant alpha n = Vector (constantP alpha n)
 
-constantP :: CNum a => a -> Int -> Vec n a
+constantP :: CNum a => a -> SNat n -> Vec n a
 constantP alpha n = makeRWV $ do
-  (VecP px _ _) <- fromListP [alpha]
+  (VecP px _ _) <- fromVectP (cons alpha nil)
   return (VecP px n 0)
 
-constantM :: CNum a => a -> (Int, Int) -> Matrix m n a
+constantM :: CNum a => a -> (SNat m, SNat n) -> Matrix m n a
 constantM alpha (m,n) = Matrix (MatP pa (m,n) 0) SFalse where
   (VecP pa _ 1) = makeRWV $ makeCopyVecP (constantP alpha m)

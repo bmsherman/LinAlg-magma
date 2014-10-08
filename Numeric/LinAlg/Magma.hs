@@ -13,6 +13,7 @@ import Foreign.CUDA.Cublas.Types (FillMode (..))
 import qualified Numeric.LinAlg.Magma.Internal as C
 import Numeric.LinAlg.Magma.Internal (GArr (..), Matrix, Vector)
 import qualified Numeric.LinAlg.Magma.Mutable as C hiding (dim)
+import qualified Numeric.LinAlg.Vect as V
 import Foreign.Storable (Storable)
 
 instance C.CNum e => Scale e GArr where
@@ -39,10 +40,10 @@ instance C.CNum e => Num (Vector n e) where
 
 instance C.CNum e => Matr e GArr where
 
-  fromLists = C.fromLists
-  toLists = C.toLists
-  fromList = C.fromList
-  toList = C.toList
+  toVects = C.toVects
+  fromVects = C.fromVects
+  toVect = C.toVect
+  fromVect = C.fromVect
 
   toRows = C.toRows
   toColumns = C.toColumns
@@ -77,12 +78,14 @@ instance C.CNum e => Matr e GArr where
   posdefSolve a b = C.chol a `cholSolve` b
   l `cholSolve` b = C.trans l C.^\ (l C..\ b)
 
+  constant = C.constant
+
 
 instance (C.CNum a, Eq a) => Eq (Matrix m n a) where
-  x == y = C.toLists x == C.toLists y
+  x == y = C.toVects x == C.toVects y
 
 instance (C.CNum a, Show a) => Show (Matrix m n a) where
-  show = show . C.toLists
+  show = show . C.toVects
 
 instance (C.CNum a, Show a) => Show (Vector n a) where
-  show = show . C.toList
+  show = show . V.toList . C.toVect
