@@ -13,7 +13,7 @@ module Numeric.LinAlg.Magma.Internal (
 
   -- * LinAlg operations
   -- ** Data transfer
-  fromList, toList, fromLists, toLists,
+  fromVect, toVect, fromVects, toVects,
   toRows, toColumns, fromRows, fromColumns,
   asColMat, asColVec,
   fromDiag, takeDiag',
@@ -61,7 +61,7 @@ import Numeric.LinAlg (Dim (..))
 import Numeric.LinAlg.Magma.Mutable hiding (dim, ld)
 import Numeric.LinAlg.SNat (SNat, snat, lit, times)
 import qualified Numeric.LinAlg.Vect as V
-import Numeric.LinAlg.Vect (Vect (MkVect), cons, nil)
+import Numeric.LinAlg.Vect (Vect, cons, nil)
 
 data SBool (b :: Bool) where 
   STrue  :: SBool True
