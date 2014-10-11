@@ -71,7 +71,7 @@ import qualified Foreign.CUDA.Magma.Types as Magma
 import GHC.TypeLits 
 
 import Numeric.LinAlg.SNat (SNat, snat, lit, times, minus)
-import Numeric.LinAlg.Vect (Vect (MkVect))
+import Numeric.LinAlg.Vect (Vect, unsafeFromList)
 import qualified Numeric.LinAlg.Vect as V
 
 import System.Mem.Weak (addFinalizer)
@@ -285,7 +285,7 @@ fromVectsP vect = do
 
 -- | Read the elements of a vector into a list.
 toVectP :: CNum e => VecP t n e -> RW s (Vect n e)
-toVectP (VecP px nx 1) = fmap MkVect $ RW (peekListArray (natInt nx) px)
+toVectP (VecP px nx 1) = fmap unsafeFromList $ RW (peekListArray (natInt nx) px)
 toVectP v = makeCopyVecP v >>= toVectP
 
 -- | Read the elements of a matrix into a list of lists in column-major
@@ -299,7 +299,7 @@ toListsP c@(MatP pa (m,n) lda) =
 
 
 toVectsP :: Storable a => MatP t m n a -> RW s (Vect n (Vect m a))
-toVectsP c = fmap (MkVect . map MkVect) (toListsP c)
+toVectsP c = fmap (unsafeFromList . map unsafeFromList) (toListsP c)
 
 -- | View the diagonal of a matrix as a vector. Note that this
 -- does not make a copy (as is evident from the type)!
